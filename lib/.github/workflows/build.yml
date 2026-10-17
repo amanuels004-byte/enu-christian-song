@@ -1,0 +1,54 @@
+
+name: Build Enu Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get source code
+        uses: actions/checkout@v4
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create Android project
+        run: flutter create --project-name enu --org com.enu.app build_app
+
+      - name: Add Enu source files
+        run: |
+          cp pubspec.yaml build_app/pubspec.yaml
+          cp -r lib/. build_app/lib/
+
+      - name: Get dependencies
+        working-directory: build_app
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: build_app
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Enu-Android-APK
+          path: build_app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
