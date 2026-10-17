@@ -9,30 +9,47 @@ import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const EnuApp());
-}
-
 const purple = Color(0xFF9B78FF);
 const background = Color(0xFF100D1C);
 const surface = Color(0xFF1D1830);
+
 const languages = ['All', 'Amharic', 'English', 'Other'];
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const EnuApp());
+}
 
 class Song {
   final String title;
   final String source;
   final bool local;
-  String language;
-  bool favorite;
+  final String language;
+  final bool favorite;
 
-  Song({
+  const Song({
     required this.title,
     required this.source,
     required this.local,
     this.language = 'Other',
     this.favorite = false,
   });
+
+  Song copyWith({
+    String? title,
+    String? source,
+    bool? local,
+    String? language,
+    bool? favorite,
+  }) {
+    return Song(
+      title: title ?? this.title,
+      source: source ?? this.source,
+      local: local ?? this.local,
+      language: language ?? this.language,
+      favorite: favorite ?? this.favorite,
+    );
+  }
 
   Map<String, dynamic> toJson() => {
         'title': title,
@@ -43,9 +60,9 @@ class Song {
       };
 
   factory Song.fromJson(Map<String, dynamic> json) => Song(
-        title: json['title'] as String,
-        source: json['source'] as String,
-        local: json['local'] as bool,
+        title: json['title'] as String? ?? 'Unknown song',
+        source: json['source'] as String? ?? '',
+        local: json['local'] as bool? ?? true,
         language: json['language'] as String? ?? 'Other',
         favorite: json['favorite'] as bool? ?? false,
       );
@@ -60,28 +77,23 @@ class EnuApp extends StatelessWidget {
       title: 'Enu',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        useMaterial3: true,
         brightness: Brightness.dark,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: purple,
-          brightness: Brightness.dark,
-        ),
         scaffoldBackgroundColor: background,
+        colorScheme: const ColorScheme.dark(
+          primary: purple,
+          secondary: purple,
+          surface: surface,
+        ),
         appBarTheme: const AppBarTheme(
           backgroundColor: background,
-          surfaceTintColor: Colors.transparent,
+          foregroundColor: Colors.white,
+          elevation: 0,
         ),
-        snackBarTheme: const SnackBarThemeData(
-          behavior: SnackBarBehavior.floating,
+        cardTheme: const CardThemeData(
+          color: surface,
+          margin: EdgeInsets.zero,
         ),
-        inputDecorationTheme: InputDecorationTheme(
-          filled: true,
-          fillColor: surface,
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(16),
-            borderSide: BorderSide.none,
-          ),
-        ),
+        useMaterial3: true,
       ),
       home: const EnuHome(),
     );
@@ -98,73 +110,85 @@ class EnuHome extends StatefulWidget {
 class _EnuHomeState extends State<EnuHome> {
   final AudioPlayer _player = AudioPlayer();
   final TextEditingController _search = TextEditingController();
-  final List<Song> _songs = [];
 
-  Song? _current;
-  bool _loading = false;
-  bool _playing = false;
-  bool _favoritesOnly = false;
-  String _language = 'All';
+  List<Song> _songs = [];
   int _tab = 0;
+  int _currentIndex = -1;
+  String _language = 'All';
+  String _query = '';
+  bool _favoritesOnly = false;
+  bool _loading = true;
+
+  Song? get _currentSong =>
+      _currentIndex >= 0 && _currentIndex < _songs.length
+          ? _songs[_currentIndex]
+          : null;
+
+  List<Song> get _visibleSongs => _songs.where((song) {
+        return (_language == 'All' || song.language == _language) &&
+            song.title.toLowerCase().contains(_query.toLowerCase()) &&
+            (!_favoritesOnly || song.favorite);
+      }).toList();
 
   @override
   void initState() {
     super.initState();
     _loadSongs();
+  }
 
-    _player.playerStateStream.listen((state) {
-      if (mounted) setState(() => _playing = state.playing);
-    });
+  @override
+  void dispose() {
+    _search.dispose();
+    _player.dispose();
+    super.dispose();
+  }
 
-    _player.playbackEventStream.listen(
-      (_) {},
-      onError: (Object error, StackTrace stack) {
-        _message('Playback failed. Check the audio source.');
-      },
-    );
+  Future<Directory> _musicDirectory() async {
+    final appDir = await getApplicationDocumentsDirectory();
+    final dir = Directory('${appDir.path}/enu_music');
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    return dir;
   }
 
   Future<void> _loadSongs() async {
-    final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getString('enu_songs');
-    if (saved == null) return;
-
     try {
-      final items = (jsonDecode(saved) as List)
-          .map((e) => Song.fromJson(Map<String, dynamic>.from(e)))
-          .where((s) => !s.local || File(s.source).existsSync())
-          .toList();
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getStringList('enu_songs') ?? [];
+      final loaded = <Song>[];
 
-      if (mounted) {
-        setState(() {
-          _songs
-            ..clear()
-            ..addAll(items);
-        });
+      for (final entry in saved) {
+        try {
+          final song = Song.fromJson(
+            Map<String, dynamic>.from(jsonDecode(entry) as Map),
+          );
+          if (song.source.isEmpty) continue;
+          if (song.local && !await File(song.source).exists()) continue;
+          loaded.add(song);
+        } catch (_) {
+          // Ignore damaged saved records.
+        }
       }
+
+      if (!mounted) return;
+      setState(() {
+        _songs = loaded;
+        _loading = false;
+      });
     } catch (_) {
-      _message('Some saved song details could not be loaded.');
+      if (!mounted) return;
+      setState(() => _loading = false);
+      _message('Could not load your music library.');
     }
   }
 
   Future<void> _saveSongs() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
+    await prefs.setStringList(
       'enu_songs',
-      jsonEncode(_songs.map((s) => s.toJson()).toList()),
+      _songs.map((song) => jsonEncode(song.toJson())).toList(),
     );
-  }
-
-  List<Song> get _visibleSongs {
-    final query = _search.text.trim().toLowerCase();
-
-    return _songs.where((song) {
-      final matchesText = song.title.toLowerCase().contains(query);
-      final matchesLanguage =
-          _language == 'All' || song.language == _language;
-      final matchesFavorite = !_favoritesOnly || song.favorite;
-      return matchesText && matchesLanguage && matchesFavorite;
-    }).toList();
   }
 
   void _message(String text) {
@@ -182,133 +206,49 @@ class _EnuHomeState extends State<EnuHome> {
       );
       if (result == null) return;
 
+      final dir = await _musicDirectory();
       int added = 0;
-      for (final file in result.files) {
-        final path = file.path;
-        if (path == null || _songs.any((s) => s.source == path)) continue;
 
-        _songs.add(Song(
-          title: file.name.replaceFirst(RegExp(r'\.[^.]+$'), ''),
-          source: path,
-          local: true,
-        ));
+      for (final picked in result.files) {
+        final path = picked.path;
+        if (path == null || path.isEmpty) continue;
+
+        final original = File(path);
+        if (!await original.exists()) continue;
+
+        final safeName = picked.name.replaceAll(
+          RegExp(r'[^a-zA-Z0-9._-]'),
+          '_',
+        );
+        final destination = File(
+          '${dir.path}/${DateTime.now().microsecondsSinceEpoch}_$safeName',
+        );
+
+        await original.copy(destination.path);
+
+        _songs.add(
+          Song(
+            title: picked.name.replaceFirst(RegExp(r'\.[^.]+$'), ''),
+            source: destination.path,
+            local: true,
+          ),
+        );
         added++;
       }
 
       await _saveSongs();
       if (mounted) setState(() {});
-      _message('$added song(s) imported. You can assign a language when adding online songs.');
-    } catch (e) {
-      _message('Could not import audio: $e');
+      _message(added > 0
+          ? '$added song(s) imported.'
+          : 'No audio files could be imported.');
+    } catch (_) {
+      _message('Import failed. Please try again.');
     }
-  }
-
-  Future<void> _addOnlineSong() async {
-    final titleController = TextEditingController();
-    final urlController = TextEditingController();
-    String selectedLanguage = 'Amharic';
-
-    final result = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, updateDialog) => AlertDialog(
-          title: const Text('Add an audio link'),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: titleController,
-                  decoration: const InputDecoration(
-                    labelText: 'Song title',
-                  ),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: urlController,
-                  keyboardType: TextInputType.url,
-                  decoration: const InputDecoration(
-                    labelText: 'Direct audio URL',
-                    hintText: 'https://example.com/song.mp3',
-                  ),
-                ),
-                const SizedBox(height: 12),
-                DropdownButtonFormField<String>(
-                  value: selectedLanguage,
-                  decoration: const InputDecoration(labelText: 'Language'),
-                  items: languages
-                      .where((language) => language != 'All')
-                      .map((language) => DropdownMenuItem(
-                            value: language,
-                            child: Text(language),
-                          ))
-                      .toList(),
-                  onChanged: (value) {
-                    if (value != null) {
-                      updateDialog(() => selectedLanguage = value);
-                    }
-                  },
-                ),
-                const SizedBox(height: 12),
-                const Text(
-                  'Use a direct audio link you have permission to play or download. A video page URL usually is not a direct audio URL.',
-                  style: TextStyle(fontSize: 12, color: Colors.white60),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('Add song'),
-            ),
-          ],
-        ),
-      ),
-    );
-
-    if (result != true) return;
-
-    final title = titleController.text.trim();
-    final url = urlController.text.trim();
-    final uri = Uri.tryParse(url);
-
-    if (title.isEmpty ||
-        uri == null ||
-        !uri.hasScheme ||
-        !(uri.scheme == 'https' || uri.scheme == 'http') ||
-        uri.host.isEmpty) {
-      _message('Enter a title and a valid HTTP(S) audio URL.');
-      return;
-    }
-
-    if (_songs.any((s) => s.source == url)) {
-      _message('That audio link is already in your library.');
-      return;
-    }
-
-    setState(() {
-      _songs.add(Song(
-        title: title,
-        source: url,
-        local: false,
-        language: selectedLanguage,
-      ));
-    });
-
-    await _saveSongs();
-    _message('Added to your library. Playback depends on the audio source.');
   }
 
   Future<void> _playSong(Song song) async {
-    setState(() {
-      _loading = true;
-      _current = song;
-    });
+    final index = _songs.indexOf(song);
+    if (index < 0) return;
 
     try {
       if (song.local) {
@@ -316,126 +256,119 @@ class _EnuHomeState extends State<EnuHome> {
       } else {
         await _player.setUrl(song.source);
       }
+      if (!mounted) return;
+      setState(() => _currentIndex = index);
       await _player.play();
     } catch (_) {
-      _message('Could not play this audio. The link may not be a direct audio file.');
-    } finally {
-      if (mounted) setState(() => _loading = false);
+      _message('Could not play this song. Check the audio file.');
     }
   }
 
   Future<void> _togglePlayback() async {
-    if (_current == null) {
+    if (_currentSong == null) {
       if (_visibleSongs.isNotEmpty) {
         await _playSong(_visibleSongs.first);
       } else {
-        _message('Import a song or add a direct audio link first.');
+        _message('Import music from your phone to start listening.');
       }
-      return;
-    }
-
-    try {
-      if (_player.playing) {
-        await _player.pause();
-      } else {
-        await _player.play();
-      }
-    } catch (_) {
-      _message('Playback could not start.');
+    } else if (_player.playing) {
+      await _player.pause();
+    } else {
+      await _player.play();
     }
   }
 
   Future<void> _toggleFavorite(Song song) async {
-    setState(() => song.favorite = !song.favorite);
+    final i = _songs.indexOf(song);
+    if (i < 0) return;
+    setState(() {
+      _songs[i] = song.copyWith(favorite: !song.favorite);
+    });
     await _saveSongs();
   }
 
   Future<void> _downloadSong(Song song) async {
     if (song.local) {
-      _message('This song is already stored locally.');
+      _message('This song is already stored on your device.');
       return;
     }
 
-    setState(() => _loading = true);
     try {
-      final dir = await getApplicationDocumentsDirectory();
-      final safeName = song.title
-          .replaceAll(RegExp(r'[^\w\- ]'), '_')
-          .trim()
-          .replaceAll(' ', '_');
+      final dir = await _musicDirectory();
       final path =
-          '${dir.path}/$safeName-${DateTime.now().millisecondsSinceEpoch}.audio';
+          '${dir.path}/${DateTime.now().microsecondsSinceEpoch}_download.mp3';
+      await Dio().download(song.source, path);
 
-      await Dio().download(
-        song.source,
-        path,
-        options: Options(
-          followRedirects: true,
-          receiveTimeout: const Duration(minutes: 5),
-        ),
-      );
+      final i = _songs.indexOf(song);
+      if (i < 0) return;
 
-      _songs.add(Song(
-        title: song.title,
-        source: path,
-        local: true,
-        language: song.language,
-        favorite: song.favorite,
-      ));
+      setState(() {
+        _songs[i] = song.copyWith(source: path, local: true);
+      });
       await _saveSongs();
-      if (mounted) setState(() {});
-      _message('Saved for offline listening.');
+      _message('Song saved for offline listening.');
     } catch (_) {
-      _message('Download failed. This source may block downloads.');
-    } finally {
-      if (mounted) setState(() => _loading = false);
+      _message('Download failed. The source may not allow downloads.');
     }
   }
 
   Future<void> _removeSong(Song song) async {
-    if (_current == song) {
+    final i = _songs.indexOf(song);
+    if (i < 0) return;
+
+    if (_currentIndex == i) {
       await _player.stop();
-      setState(() => _current = null);
+      _currentIndex = -1;
+    } else if (_currentIndex > i) {
+      _currentIndex--;
     }
 
-    setState(() => _songs.remove(song));
+    setState(() => _songs.removeAt(i));
     await _saveSongs();
+    _message('Song removed from your library.');
   }
 
-  String _duration(Duration? duration) {
-    if (duration == null) return '--:--';
-    final m = duration.inMinutes;
-    final s = (duration.inSeconds % 60).toString().padLeft(2, '0');
-    return '$m:$s';
+  void _openProfile() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const ProfileScreen()),
+    );
   }
 
-  @override
-  void dispose() {
-    _player.dispose();
-    _search.dispose();
-    super.dispose();
+  void _openSettings() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const SettingsScreen()),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    final visible = _visibleSongs;
-
     return Scaffold(
       appBar: AppBar(
         title: const Row(
           children: [
             Icon(Icons.graphic_eq, color: purple, size: 30),
             SizedBox(width: 8),
-            Text(
-              'Enu',
-              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 26),
-            ),
+            Text('Enu', style: TextStyle(fontWeight: FontWeight.bold)),
           ],
         ),
         actions: [
           IconButton(
+            tooltip: 'Profile',
+            onPressed: _openProfile,
+            icon: const Icon(Icons.account_circle_outlined),
+          ),
+          IconButton(
+            tooltip: 'Settings',
+            onPressed: _openSettings,
+            icon: const Icon(Icons.settings_outlined),
+          ),
+          IconButton(
             tooltip: 'Show favorites only',
-            onPressed: () => setState(() => _favoritesOnly = !_favoritesOnly),
+            onPressed: () => setState(
+              () => _favoritesOnly = !_favoritesOnly,
+            ),
             icon: Icon(
               _favoritesOnly ? Icons.favorite : Icons.favorite_border,
               color: _favoritesOnly ? Colors.pinkAccent : null,
@@ -443,28 +376,27 @@ class _EnuHomeState extends State<EnuHome> {
           ),
         ],
       ),
-      body: SafeArea(
-        child: Column(
-          children: [
-            Expanded(
-              child: IndexedStack(
-                index: _tab,
-                children: [
-                  _home(visible),
-                  _searchPage(visible),
-                  _libraryPage(visible),
-                ],
-              ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : IndexedStack(
+              index: _tab,
+              children: [
+                _homePage(),
+                _searchPage(),
+                _libraryPage(),
+              ],
             ),
-            if (_current != null) _miniPlayer(),
-          ],
-        ),
-      ),
+      floatingActionButton: _tab == 2
+          ? FloatingActionButton.extended(
+              onPressed: _pickSongs,
+              icon: const Icon(Icons.add),
+              label: const Text('Import music'),
+            )
+          : null,
       bottomNavigationBar: NavigationBar(
         selectedIndex: _tab,
-        onDestinationSelected: (value) => setState(() => _tab = value),
-        backgroundColor: const Color(0xFF181326),
-        indicatorColor: const Color(0xFF39285E),
+        onDestinationSelected: (index) => setState(() => _tab = index),
+        backgroundColor: surface,
         destinations: const [
           NavigationDestination(
             icon: Icon(Icons.home_outlined),
@@ -482,262 +414,221 @@ class _EnuHomeState extends State<EnuHome> {
           ),
         ],
       ),
-      floatingActionButton: _tab == 2
-          ? FloatingActionButton.extended(
+      bottomSheet: _currentSong == null
+          ? null
+          : _miniPlayer(),
+    );
+  }
+
+  Widget _homePage() => ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Container(
+            padding: const EdgeInsets.all(22),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(24),
+              gradient: const LinearGradient(
+                colors: [Color(0xFF493078), Color(0xFF211638)],
+              ),
+            ),
+            child: const Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.favorite, color: purple, size: 32),
+                SizedBox(height: 14),
+                Text(
+                  'Music for your worship',
+                  style: TextStyle(
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                SizedBox(height: 8),
+                Text(
+                  'Keep your favorite Christian songs close.',
+                  style: TextStyle(color: Colors.white70),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+          _languageFilters(),
+          const SizedBox(height: 22),
+          _heading('Your music', '${_visibleSongs.length} songs'),
+          const SizedBox(height: 12),
+          if (_visibleSongs.isEmpty)
+            _emptyState(
+              'Your collection starts here',
+              'Import music from your phone to begin your worship collection.',
+            )
+          else
+            ..._visibleSongs.map(_songTile),
+          const SizedBox(height: 100),
+        ],
+      );
+
+  Widget _searchPage() => ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text(
+            'Search your library',
+            style: TextStyle(fontSize: 25, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: _search,
+            onChanged: (value) => setState(() => _query = value),
+            decoration: InputDecoration(
+              hintText: 'Search song titles...',
+              prefixIcon: const Icon(Icons.search),
+              suffixIcon: _query.isEmpty
+                  ? null
+                  : IconButton(
+                      onPressed: () {
+                        _search.clear();
+                        setState(() => _query = '');
+                      },
+                      icon: const Icon(Icons.close),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          _languageFilters(),
+          const SizedBox(height: 16),
+          if (_visibleSongs.isEmpty)
+            _emptyState(
+              'No songs found',
+              'Try another title or import music from your phone.',
+            )
+          else
+            ..._visibleSongs.map(_songTile),
+          const SizedBox(height: 100),
+        ],
+      );
+
+  Widget _libraryPage() {
+    final favorites = _songs.where((song) => song.favorite).length;
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text(
+          'Your Library',
+          style: TextStyle(fontSize: 25, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 18),
+        Card(
+          child: ListTile(
+            leading: const CircleAvatar(
+              backgroundColor: Color(0xFF39285E),
+              child: Icon(Icons.favorite, color: purple),
+            ),
+            title: const Text('Favorite songs'),
+            subtitle: Text('$favorites saved favorites'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () {
+              setState(() {
+                _favoritesOnly = true;
+                _tab = 0;
+              });
+            },
+          ),
+        ),
+        const SizedBox(height: 20),
+        _heading('All songs', '${_songs.length} songs'),
+        const SizedBox(height: 12),
+        if (_songs.isEmpty)
+          _emptyState(
+            'Your library is empty',
+            'Import audio files from your phone to get started.',
+          )
+        else
+          ..._songs.map(_songTile),
+        const SizedBox(height: 100),
+      ],
+    );
+  }
+
+  Widget _languageFilters() => SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: languages.map((language) {
+            final selected = _language == language;
+            return Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: ChoiceChip(
+                label: Text(language),
+                selected: selected,
+                onSelected: (_) => setState(() => _language = language),
+                selectedColor: purple,
+                backgroundColor: surface,
+                side: BorderSide.none,
+              ),
+            );
+          }).toList(),
+        ),
+      );
+
+  Widget _heading(String title, String subtitle) => Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+          ),
+          Text(subtitle, style: const TextStyle(color: Colors.white54)),
+        ],
+      );
+
+  Widget _emptyState(String title, String subtitle) => Container(
+        padding: const EdgeInsets.all(24),
+        decoration: BoxDecoration(
+          color: surface,
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Column(
+          children: [
+            const Icon(Icons.music_note_outlined, size: 48, color: purple),
+            const SizedBox(height: 12),
+            Text(
+              title,
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              subtitle,
+              style: const TextStyle(color: Colors.white60),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
               onPressed: _pickSongs,
               icon: const Icon(Icons.add),
               label: const Text('Import music'),
-            )
-          : FloatingActionButton(
-              onPressed: _addOnlineSong,
-              tooltip: 'Add a direct audio link',
-              child: const Icon(Icons.add_link),
-            ),
-    );
-  }
-
-  Widget _home(List<Song> visible) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(18, 8, 18, 18),
-      children: [
-        Container(
-          padding: const EdgeInsets.all(22),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(26),
-            gradient: const LinearGradient(
-              colors: [Color(0xFF7146C8), Color(0xFF302047), background],
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-            ),
-          ),
-          child: const Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Icon(Icons.favorite, color: Colors.white, size: 28),
-              SizedBox(height: 16),
-              Text(
-                'Praise in every moment',
-                style: TextStyle(fontSize: 25, fontWeight: FontWeight.w800),
-              ),
-              SizedBox(height: 8),
-              Text(
-                'A place for your worship, wherever you go.',
-                style: TextStyle(color: Colors.white70),
-              ),
-              SizedBox(height: 12),
-              Text(
-                'AMHARIC  •  ENGLISH  •  WORSHIP',
-                style: TextStyle(
-                  fontSize: 11,
-                  letterSpacing: 1.2,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 24),
-        const Text(
-          'Explore by language',
-          style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-        ),
-        const SizedBox(height: 12),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: languages.map((language) {
-            return ChoiceChip(
-              label: Text(language),
-              selected: _language == language,
-              onSelected: (_) => setState(() => _language = language),
-              selectedColor: purple,
-            );
-          }).toList(),
-        ),
-        const SizedBox(height: 26),
-        Row(
-          children: [
-            const Expanded(
-              child: Text(
-                'Your music',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-              ),
-            ),
-            Text('${visible.length} songs',
-                style: const TextStyle(color: Colors.white60)),
-          ],
-        ),
-        const SizedBox(height: 10),
-        if (visible.isEmpty)
-          _emptyState(
-            _favoritesOnly
-                ? 'No favorites in this selection'
-                : 'Your worship collection starts here',
-            'Import music from your phone or add a permitted direct audio link.',
-            Icons.music_note_rounded,
-          )
-        else
-          ...visible.take(6).map(_songTile),
-        if (visible.length > 6)
-          TextButton(
-            onPressed: () => setState(() => _tab = 2),
-            child: const Text('See all songs'),
-          ),
-      ],
-    );
-  }
-
-  Widget _searchPage(List<Song> visible) {
-    return ListView(
-      padding: const EdgeInsets.all(18),
-      children: [
-        const Text(
-          'Find your worship',
-          style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800),
-        ),
-        const SizedBox(height: 6),
-        const Text(
-          'Search songs saved in your library.',
-          style: TextStyle(color: Colors.white60),
-        ),
-        const SizedBox(height: 18),
-        TextField(
-          controller: _search,
-          onChanged: (_) => setState(() {}),
-          decoration: InputDecoration(
-            hintText: 'Search song titles...',
-            prefixIcon: const Icon(Icons.search),
-            suffixIcon: IconButton(
-              onPressed: () {
-                _search.clear();
-                setState(() {});
-              },
-              icon: const Icon(Icons.close),
-            ),
-          ),
-        ),
-        const SizedBox(height: 14),
-        Wrap(
-          spacing: 8,
-          children: languages.map((language) {
-            return ChoiceChip(
-              label: Text(language),
-              selected: _language == language,
-              onSelected: (_) => setState(() => _language = language),
-            );
-          }).toList(),
-        ),
-        const SizedBox(height: 12),
-        if (visible.isEmpty)
-          _emptyState(
-            'No matching songs',
-            'Try another title or language, or add music to your library.',
-            Icons.search_off,
-          )
-        else
-          ...visible.map(_songTile),
-      ],
-    );
-  }
-
-  Widget _libraryPage(List<Song> visible) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(18, 8, 18, 100),
-      children: [
-        const Text(
-          'Your library',
-          style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800),
-        ),
-        const SizedBox(height: 6),
-        Text(
-          '${_songs.length} saved songs',
-          style: const TextStyle(color: Colors.white60),
-        ),
-        const SizedBox(height: 16),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            FilterChip(
-              label: const Text('All songs'),
-              selected: !_favoritesOnly,
-              onSelected: (_) => setState(() => _favoritesOnly = false),
-            ),
-            FilterChip(
-              label: const Text('Favorites'),
-              selected: _favoritesOnly,
-              onSelected: (_) => setState(() => _favoritesOnly = true),
             ),
           ],
         ),
-        const SizedBox(height: 12),
-        if (visible.isEmpty)
-          _emptyState(
-            'Your library is waiting',
-            'Import audio or add a direct audio link to get started.',
-            Icons.library_music,
-          )
-        else
-          ...visible.map(_songTile),
-      ],
-    );
-  }
-
-  Widget _emptyState(String title, String subtitle, IconData icon) {
-    return Container(
-      margin: const EdgeInsets.only(top: 18),
-      padding: const EdgeInsets.all(26),
-      decoration: BoxDecoration(
-        color: surface,
-        borderRadius: BorderRadius.circular(24),
-      ),
-      child: Column(
-        children: [
-          Icon(icon, color: purple, size: 54),
-          const SizedBox(height: 14),
-          Text(
-            title,
-            textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            subtitle,
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.white60),
-          ),
-          const SizedBox(height: 16),
-          FilledButton.icon(
-            onPressed: _pickSongs,
-            icon: const Icon(Icons.folder_open),
-            label: const Text('Import songs'),
-          ),
-        ],
-      ),
-    );
-  }
+      );
 
   Widget _songTile(Song song) {
-    final isCurrent = _current == song;
+    final current = _currentSong == song;
 
     return Card(
       margin: const EdgeInsets.only(bottom: 8),
-      color: isCurrent ? const Color(0xFF302349) : surface,
       child: ListTile(
         onTap: () => _playSong(song),
         leading: Container(
-          width: 48,
-          height: 48,
+          width: 46,
+          height: 46,
           decoration: BoxDecoration(
-            color: const Color(0xFF45316B),
-            borderRadius: BorderRadius.circular(14),
+            color: const Color(0xFF39285E),
+            borderRadius: BorderRadius.circular(12),
           ),
           child: Icon(
-            isCurrent && _playing
+            current && _player.playing
                 ? Icons.equalizer
-                : song.local
-                    ? Icons.music_note
-                    : Icons.cloud_outlined,
+                : Icons.music_note,
             color: purple,
           ),
         ),
@@ -745,29 +636,29 @@ class _EnuHomeState extends State<EnuHome> {
           song.title,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontWeight: FontWeight.w600),
         ),
-        subtitle: Text('${song.language} • ${song.local ? 'Offline' : 'Online audio'}'),
+        subtitle: Text(
+          '${song.language} • ${song.local ? 'On device' : 'Online source'}',
+        ),
         trailing: PopupMenuButton<String>(
-          onSelected: (value) {
-            if (value == 'favorite') _toggleFavorite(song);
-            if (value == 'download') _downloadSong(song);
-            if (value == 'remove') _removeSong(song);
-            if (value == 'play') _playSong(song);
+          onSelected: (action) async {
+            if (action == 'play') await _playSong(song);
+            if (action == 'favorite') await _toggleFavorite(song);
+            if (action == 'download') await _downloadSong(song);
+            if (action == 'remove') await _removeSong(song);
           },
           itemBuilder: (_) => [
-            const PopupMenuItem(
-              value: 'play',
-              child: Text('Play song'),
-            ),
+            const PopupMenuItem(value: 'play', child: Text('Play')),
             PopupMenuItem(
               value: 'favorite',
-              child: Text(song.favorite ? 'Remove favorite' : 'Add to favorites'),
+              child: Text(
+                song.favorite ? 'Remove favorite' : 'Add to favorites',
+              ),
             ),
             if (!song.local)
               const PopupMenuItem(
                 value: 'download',
-                child: Text('Download for offline'),
+                child: Text('Download'),
               ),
             const PopupMenuItem(
               value: 'remove',
@@ -779,117 +670,344 @@ class _EnuHomeState extends State<EnuHome> {
     );
   }
 
-  Widget _miniPlayer() {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
-      decoration: const BoxDecoration(
-        color: Color(0xFF211A32),
-        border: Border(top: BorderSide(color: Color(0xFF423456))),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          StreamBuilder<Duration?>(
-            stream: _player.durationStream,
-            builder: (context, durationSnapshot) {
-              final duration = durationSnapshot.data;
-              return StreamBuilder<Duration>(
-                stream: _player.positionStream,
-                builder: (context, positionSnapshot) {
-                  final position = positionSnapshot.data ?? Duration.zero;
-                  final maxMs = duration?.inMilliseconds ?? 1;
-                  final value =
-                      position.inMilliseconds.clamp(0, maxMs).toDouble();
-
-                  return Column(
-                    children: [
-                      Slider(
-                        value: value,
-                        max: maxMs.toDouble(),
-                        onChanged: duration == null
-                            ? null
-                            : (v) => _player.seek(
-                                  Duration(milliseconds: v.round()),
-                                ),
-                      ),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          Text(_duration(position),
-                              style: const TextStyle(fontSize: 11)),
-                          Text(_duration(duration),
-                              style: const TextStyle(fontSize: 11)),
-                        ],
-                      ),
-                    ],
-                  );
-                },
-              );
-            },
-          ),
-          Row(
+  Widget _miniPlayer() => SafeArea(
+        child: Container(
+          color: const Color(0xFF302347),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
             children: [
-              Container(
-                width: 42,
-                height: 42,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF45316B),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: const Icon(Icons.album, color: purple),
-              ),
-              const SizedBox(width: 12),
+              const Icon(Icons.music_note, color: purple, size: 30),
+              const SizedBox(width: 10),
               Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      _current!.title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontWeight: FontWeight.bold),
-                    ),
-                    Text(
-                      '${_current!.language} • ${_current!.local ? 'Offline' : 'Online'}',
-                      style: const TextStyle(
-                        color: Colors.white60,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
+                child: Text(
+                  _currentSong!.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
               IconButton(
-                onPressed: () => _toggleFavorite(_current!),
+                onPressed: _togglePlayback,
+                icon: StreamBuilder<PlayerState>(
+                  stream: _player.playerStateStream,
+                  builder: (context, snapshot) {
+                    final playing = snapshot.data?.playing ?? false;
+                    return Icon(
+                      playing ? Icons.pause : Icons.play_arrow,
+                    );
+                  },
+                ),
+              ),
+              IconButton(
+                onPressed: _currentSong == null
+                    ? null
+                    : () => _toggleFavorite(_currentSong!),
                 icon: Icon(
-                  _current!.favorite ? Icons.favorite : Icons.favorite_border,
-                  color: _current!.favorite ? Colors.pinkAccent : null,
+                  _currentSong?.favorite == true
+                      ? Icons.favorite
+                      : Icons.favorite_border,
+                  color: _currentSong?.favorite == true
+                      ? Colors.pinkAccent
+                      : null,
                 ),
-              ),
-              IconButton(
-                onPressed: _loading ? null : _togglePlayback,
-                icon: _loading
-                    ? const SizedBox(
-                        width: 22,
-                        height: 22,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : Icon(_playing ? Icons.pause_circle : Icons.play_circle,
-                        size: 34),
-              ),
-              IconButton(
-                tooltip: 'Next song',
-                onPressed: () async {
-                  final i = _songs.indexOf(_current!);
-                  if (i >= 0 && i < _songs.length - 1) {
-                    await _playSong(_songs[i + 1]);
-                  }
-                },
-                icon: const Icon(Icons.skip_next),
               ),
             ],
           ),
+        ),
+      );
+}
+
+class ProfileScreen extends StatelessWidget {
+  const ProfileScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Your Profile')),
+      body: ListView(
+        padding: const EdgeInsets.all(20),
+        children: [
+          const SizedBox(height: 20),
+          const CircleAvatar(
+            radius: 42,
+            backgroundColor: Color(0xFF39285E),
+            child: Icon(Icons.person_outline, size: 48, color: purple),
+          ),
+          const SizedBox(height: 18),
+          const Center(
+            child: Text(
+              'Welcome to Enu',
+              style: TextStyle(fontSize: 25, fontWeight: FontWeight.bold),
+            ),
+          ),
+          const SizedBox(height: 8),
+          const Center(
+            child: Text('Guest mode', style: TextStyle(color: Colors.white60)),
+          ),
+          const SizedBox(height: 28),
+          const Card(
+            child: ListTile(
+              leading: Icon(Icons.music_note, color: purple),
+              title: Text('Listen as a guest'),
+              subtitle: Text(
+                'Import and play music from your phone without an account.',
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          const Card(
+            child: ListTile(
+              leading: Icon(Icons.cloud_outlined, color: purple),
+              title: Text('Online music'),
+              subtitle: Text(
+                'Online features and account services are not connected yet.',
+              ),
+            ),
+          ),
+          const SizedBox(height: 24),
+          FilledButton.icon(
+            onPressed: () {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Online sign-in will be added in a future update.'),
+                ),
+              );
+            },
+            icon: const Icon(Icons.login),
+            label: const Text('Sign in / Create account'),
+          ),
         ],
+      ),
+    );
+  }
+}
+
+class SettingsScreen extends StatefulWidget {
+  const SettingsScreen({super.key});
+
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  bool _backgroundPlayback = true;
+  bool _autoplay = false;
+  bool _shuffle = false;
+  bool _repeat = false;
+  bool _loaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSettings();
+  }
+
+  Future<void> _loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+
+    setState(() {
+      _backgroundPlayback =
+          prefs.getBool('enu_background_playback') ?? true;
+      _autoplay = prefs.getBool('enu_autoplay') ?? false;
+      _shuffle = prefs.getBool('enu_shuffle') ?? false;
+      _repeat = prefs.getBool('enu_repeat') ?? false;
+      _loaded = true;
+    });
+  }
+
+  Future<void> _saveSetting(String key, bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(key, value);
+  }
+
+  void _showInfo(String title, String message) {
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: SingleChildScrollView(child: Text(message)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Settings')),
+      body: !_loaded
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                const _SettingsHeading('PLAYBACK'),
+                Card(
+                  child: Column(
+                    children: [
+                      SwitchListTile(
+                        secondary: const Icon(Icons.headphones),
+                        title: const Text('Background playback'),
+                        subtitle: const Text(
+                          'Requires the upcoming Android audio-service setup.',
+                        ),
+                        value: _backgroundPlayback,
+                        onChanged: (value) {
+                          setState(() => _backgroundPlayback = value);
+                          _saveSetting('enu_background_playback', value);
+                        },
+                      ),
+                      const Divider(height: 1),
+                      SwitchListTile(
+                        secondary: const Icon(Icons.play_circle_outline),
+                        title: const Text('Autoplay'),
+                        subtitle: const Text(
+                          'Preference saved; automatic next-song playback is not connected yet.',
+                        ),
+                        value: _autoplay,
+                        onChanged: (value) {
+                          setState(() => _autoplay = value);
+                          _saveSetting('enu_autoplay', value);
+                        },
+                      ),
+                      const Divider(height: 1),
+                      SwitchListTile(
+                        secondary: const Icon(Icons.shuffle),
+                        title: const Text('Shuffle'),
+                        subtitle: const Text(
+                          'Preference only; shuffle playback is not connected yet.',
+                        ),
+                        value: _shuffle,
+                        onChanged: (value) {
+                          setState(() => _shuffle = value);
+                          _saveSetting('enu_shuffle', value);
+                        },
+                      ),
+                      const Divider(height: 1),
+                      SwitchListTile(
+                        secondary: const Icon(Icons.repeat),
+                        title: const Text('Repeat'),
+                        subtitle: const Text(
+                          'Preference only; repeat playback is not connected yet.',
+                        ),
+                        value: _repeat,
+                        onChanged: (value) {
+                          setState(() => _repeat = value);
+                          _saveSetting('enu_repeat', value);
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 24),
+                const _SettingsHeading('YOUR APP'),
+                Card(
+                  child: Column(
+                    children: [
+                      ListTile(
+                        leading: const Icon(Icons.language),
+                        title: const Text('Music languages'),
+                        subtitle: const Text('Amharic, English and Other'),
+                        onTap: () => _showInfo(
+                          'Music languages',
+                          'Use the language filters on Home and Search to filter songs in your library. Imported songs currently start with the language Other.',
+                        ),
+                      ),
+                      const Divider(height: 1),
+                      ListTile(
+                        leading: const Icon(Icons.palette_outlined),
+                        title: const Text('Appearance'),
+                        subtitle: const Text('Dark purple'),
+                        onTap: () => _showInfo(
+                          'Appearance',
+                          'Enu currently uses the dark purple theme.',
+                        ),
+                      ),
+                      const Divider(height: 1),
+                      ListTile(
+                        leading: const Icon(Icons.person_outline),
+                        title: const Text('Profile and account'),
+                        trailing: const Icon(Icons.chevron_right),
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => const ProfileScreen(),
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 24),
+                const _SettingsHeading('INFORMATION'),
+                Card(
+                  child: Column(
+                    children: [
+                      ListTile(
+                        leading: const Icon(Icons.info_outline),
+                        title: const Text('About Enu'),
+                        onTap: () => _showInfo(
+                          'About Enu',
+                          'Enu is a Christian music app for worship music and personal music libraries.',
+                        ),
+                      ),
+                      const Divider(height: 1),
+                      ListTile(
+                        leading: const Icon(Icons.description_outlined),
+                        title: const Text('Terms of use'),
+                        onTap: () => _showInfo(
+                          'Terms of use',
+                          'Use music you own or have permission to play and download. Online features must follow their providers’ terms. Official terms will be published when online services are ready.',
+                        ),
+                      ),
+                      const Divider(height: 1),
+                      ListTile(
+                        leading: const Icon(Icons.privacy_tip_outlined),
+                        title: const Text('Privacy'),
+                        onTap: () => _showInfo(
+                          'Privacy',
+                          'Enu saves your library details and preferences on your device. Online account and data-handling details must be explained before online services launch.',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 24),
+                const Center(
+                  child: Text(
+                    'Enu • Version 1.0.0',
+                    style: TextStyle(color: Colors.white54),
+                  ),
+                ),
+                const SizedBox(height: 20),
+              ],
+            ),
+    );
+  }
+}
+
+class _SettingsHeading extends StatelessWidget {
+  final String text;
+
+  const _SettingsHeading(this.text);
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Text(
+        text,
+        style: const TextStyle(
+          color: purple,
+          fontWeight: FontWeight.bold,
+          letterSpacing: 1.4,
+        ),
       ),
     );
   }
