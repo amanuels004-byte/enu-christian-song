@@ -13,6 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Get source code
         uses: actions/checkout@v4
@@ -37,9 +38,37 @@ jobs:
           cp pubspec.yaml build_app/pubspec.yaml
           cp -r lib/. build_app/lib/
 
+      - name: Convert Enu logo to PNG
+        run: |
+          python3 -m pip install Pillow
+          mkdir -p build_app/assets
+          python3 - <<'PY'
+          from PIL import Image
+          with Image.open("my logo.jfif") as image:
+              image.convert("RGBA").save("build_app/assets/enu_logo.png")
+          PY
+
+      - name: Configure launcher icon
+        working-directory: build_app
+        run: |
+          sed -i '/flutter_lints: \^5.0.0/a\  flutter_launcher_icons: ^0.14.4' pubspec.yaml
+          cat >> pubspec.yaml <<'EOF'
+
+          flutter_launcher_icons:
+            android: true
+            ios: false
+            image_path: "assets/enu_logo.png"
+            adaptive_icon_background: "#24104F"
+            adaptive_icon_foreground: "assets/enu_logo.png"
+          EOF
+
       - name: Get dependencies
         working-directory: build_app
         run: flutter pub get
+
+      - name: Generate Enu app icon
+        working-directory: build_app
+        run: dart run flutter_launcher_icons
 
       - name: Build APK
         working-directory: build_app
@@ -51,4 +80,3 @@ jobs:
           name: Enu-Android-APK
           path: build_app/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
-
