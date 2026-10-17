@@ -134,7 +134,9 @@ class Playlist {
   factory Playlist.fromJson(Map<String, dynamic> json) => Playlist(
         id: json['id'] as String? ?? DateTime.now().toIso8601String(),
         name: json['name'] as String? ?? 'Playlist',
-        songIds: (json['songIds'] as List?)?.whereType<String>().toList(),
+        songIds: ((json['songIds'] as List?) ?? [])
+            .map((e) => e.toString())
+            .toList(),
       );
 }
 
