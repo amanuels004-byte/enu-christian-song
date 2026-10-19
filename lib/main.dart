@@ -1,1300 +1,798 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
-import 'package:path_provider/path_provider.dart';
+import 'package:just_audio_background/just_audio_background.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const SelamApp());
-}
+const purple = Color(0xFF8050D5);
+const kBg = Color(0xFF130F1B);
+const kSurface = Color(0xFF191323);
+const cardBorder = Color(0xFF30243E);
+const muted = Color(0xFF9A90A8);
 
-enum Lang { amharic, english }
+const audioExts = ['.mp3', '.m4a', '.aac', '.wav', '.flac', '.ogg', '.opus'];
 
 class Song {
-  final String id, title, artist;
-  final Lang lang;
-  final String? path;
+  final String path, title, folder;
+  Song(this.path, this.title, this.folder);
 
-  const Song({
-    required this.id,
-    required this.title,
-    required this.artist,
-    required this.lang,
-    this.path,
-  });
-
-  bool get isLocal => path != null && path!.isNotEmpty;
-
-  Map<String, dynamic> toJson() => {
-        'id': id,
-        'title': title,
-        'artist': artist,
-        'lang': lang.name,
-        'path': path,
-      };
-
-  factory Song.fromJson(Map<String, dynamic> j) => Song(
-        id: j['id'] as String? ??
-            DateTime.now().microsecondsSinceEpoch.toString(),
-        title: j['title'] as String? ?? 'Unknown song',
-        artist: j['artist'] as String? ?? 'Unknown artist',
-        lang: Lang.values.firstWhere(
-          (x) => x.name == j['lang'],
-          orElse: () => Lang.english,
-        ),
-        path: j['path'] as String?,
-      );
+  factory Song.fromPath(String p) {
+    final parts = p.split('/');
+    final file = parts.last;
+    final dot = file.lastIndexOf('.');
+    final title = dot > 0 ? file.substring(0, dot) : file;
+    final folder = parts.length > 1 ? parts[parts.length - 2] : '';
+    return Song(p, title, folder);
+  }
 }
 
-class LocalUser {
-  String name;
-  final String email;
-  final String password;
+class AppState extends ChangeNotifier {
+  final player = AudioPlayer();
+  late SharedPreferences prefs;
 
-  LocalUser(this.name, this.email, this.password);
-
-  Map<String, dynamic> toJson() => {
-        'name': name,
-        'email': email,
-        'password': password,
-      };
-
-  factory LocalUser.fromJson(Map<String, dynamic> j) => LocalUser(
-        j['name'] as String? ?? 'Listener',
-        j['email'] as String,
-        j['password'] as String? ?? '',
-      );
-}
-
-class SelamState extends ChangeNotifier {
-  static const _usersKey = 'selam_users_v1';
-  static const _activeKey = 'selam_active_v1';
-  static const _songsKey = 'selam_songs_v1';
-  static const _favsKey = 'selam_favs_v1';
-  static const _themeKey = 'selam_dark_v1';
-  static const _filterKey = 'selam_filter_v1';
-  static const _recentKey = 'selam_recent_v1';
-
-  final AudioPlayer player = AudioPlayer();
-  final Map<String, LocalUser> _users = {};
-  final List<Song> songs = [];
-  final Set<String> favoriteIds = {};
-  final List<String> recentIds = [];
-
-  LocalUser? user;
-  ThemeMode themeMode = ThemeMode.dark;
-  Lang? filter;
+  List<Song> songs = [];
+  List<Song> queue = [];
   Song? current;
-  bool loading = true;
-  String? message;
+  bool scanning = false;
+  bool permissionDenied = false;
+  Set<String> favorites = {};
+  List<String> recents = [];
+  List<Map<String, dynamic>> notes = [];
+  String name = 'Friend';
+  bool shuffleDefault = false;
+  int played = 0;
 
-  StreamSubscription<PlayerState>? _playerSub;
-  StreamSubscription<Duration?>? _durationSub;
-
-  bool get playing => player.playing;
-  Duration get position => player.position;
-  Duration get duration => player.duration ?? Duration.zero;
-
-  List<Song> get visible => songs
-      .where((s) => filter == null || s.lang == filter)
-      .toList();
-
-  List<Song> get favorites =>
-      songs.where((s) => favoriteIds.contains(s.id)).toList();
-
-  List<Song> get recents => recentIds
-      .map((id) => songs.where((s) => s.id == id).firstOrNull)
-      .whereType<Song>()
-      .toList();
+  int get unread => notes.where((n) => n['read'] != true).length;
 
   Future<void> init() async {
-    try {
-      final p = await SharedPreferences.getInstance();
+    prefs = await SharedPreferences.getInstance();
+    name = prefs.getString('name') ?? 'Friend';
+    favorites = (prefs.getStringList('favs') ?? []).toSet();
+    recents = prefs.getStringList('recents') ?? [];
+    shuffleDefault = prefs.getBool('shuffle') ?? false;
+    played = prefs.getInt('played') ?? 0;
+    notes = (prefs.getStringList('notes') ?? [])
+        .map((e) => jsonDecode(e) as Map<String, dynamic>)
+        .toList();
+    songs = (prefs.getStringList('songs') ?? [])
+        .where((p) => File(p).existsSync())
+        .map(Song.fromPath)
+        .toList();
 
-      final rawUsers = p.getString(_usersKey);
-      if (rawUsers != null) {
-        for (final x in jsonDecode(rawUsers) as List) {
-          final u = LocalUser.fromJson(
-            Map<String, dynamic>.from(x as Map),
-          );
-          _users[u.email] = u;
-        }
-      }
-
-      final rawSongs = p.getString(_songsKey);
-      if (rawSongs != null) {
-        for (final x in jsonDecode(rawSongs) as List) {
-          final s = Song.fromJson(
-            Map<String, dynamic>.from(x as Map),
-          );
-
-          if (!s.isLocal || File(s.path!).existsSync()) {
-            songs.add(s);
-          }
-        }
-      }
-
-      favoriteIds.addAll(p.getStringList(_favsKey) ?? const []);
-      recentIds.addAll(p.getStringList(_recentKey) ?? const []);
-
-      themeMode = p.getBool(_themeKey) == false
-          ? ThemeMode.light
-          : ThemeMode.dark;
-
-      final f = p.getString(_filterKey);
-      filter = f == null
-          ? null
-          : Lang.values.where((x) => x.name == f).firstOrNull;
-
-      final active = p.getString(_activeKey);
-      if (active != null) {
-        user = _users[active];
-      }
-
-      _playerSub =
-          player.playerStateStream.listen((_) => notifyListeners());
-
-      _durationSub =
-          player.durationStream.listen((_) => notifyListeners());
-    } catch (_) {
-      message =
-          'Some saved data could not be loaded. You can continue using the app.';
-    } finally {
-      loading = false;
-      notifyListeners();
-    }
-  }
-
-  Future<void> _saveUsers() async {
-    final p = await SharedPreferences.getInstance();
-    await p.setString(
-      _usersKey,
-      jsonEncode(_users.values.map((u) => u.toJson()).toList()),
-    );
-  }
-
-  Future<void> _saveSongs() async {
-    final p = await SharedPreferences.getInstance();
-    await p.setString(
-      _songsKey,
-      jsonEncode(songs.map((s) => s.toJson()).toList()),
-    );
-  }
-
-  Future<void> _saveActive() async {
-    final p = await SharedPreferences.getInstance();
-
-    if (user == null) {
-      await p.remove(_activeKey);
-    } else {
-      await p.setString(_activeKey, user!.email);
-    }
-  }
-
-  String? signUp(String name, String email, String password) {
-    final e = email.trim().toLowerCase();
-
-    if (name.trim().isEmpty) {
-      return 'Enter your name.';
-    }
-
-    if (!e.contains('@') || !e.contains('.')) {
-      return 'Enter a valid email.';
-    }
-
-    if (password.length < 6) {
-      return 'Password must be at least 6 characters.';
-    }
-
-    if (_users.containsKey(e)) {
-      return 'An account with this email already exists.';
-    }
-
-    user = LocalUser(name.trim(), e, password);
-    _users[e] = user!;
-
-    unawaited(_saveUsers());
-    unawaited(_saveActive());
-    notifyListeners();
-
-    return null;
-  }
-
-  String? logIn(String email, String password) {
-    final u = _users[email.trim().toLowerCase()];
-
-    if (u == null || u.password != password) {
-      return 'Wrong email or password.';
-    }
-
-    user = u;
-    unawaited(_saveActive());
-    notifyListeners();
-
-    return null;
-  }
-
-  Future<void> logOut() async {
-    await stop();
-    user = null;
-    await _saveActive();
-    notifyListeners();
-  }
-
-  Future<void> deleteAccount() async {
-    if (user != null) {
-      _users.remove(user!.email);
-    }
-
-    await logOut();
-    await _saveUsers();
-  }
-
-  void setName(String name) {
-    if (user == null || name.trim().isEmpty) return;
-
-    user!.name = name.trim();
-    unawaited(_saveUsers());
-    notifyListeners();
-  }
-
-  void setTheme(bool dark) {
-    themeMode = dark ? ThemeMode.dark : ThemeMode.light;
-
-    SharedPreferences.getInstance().then(
-      (p) => p.setBool(_themeKey, dark),
-    );
-
-    notifyListeners();
-  }
-
-  void setFilter(Lang? l) {
-    filter = l;
-
-    SharedPreferences.getInstance().then((p) {
-      if (l == null) {
-        p.remove(_filterKey);
-      } else {
-        p.setString(_filterKey, l.name);
+    player.currentIndexStream.listen((i) {
+      if (i != null && i < queue.length) {
+        current = queue[i];
+        _addRecent(current!.path);
+        played++;
+        prefs.setInt('played', played);
+        notifyListeners();
       }
     });
 
+    if (notes.isEmpty) {
+      addNote('Welcome to Enu', 'Your music works offline. Songs are read straight from your phone.');
+    }
+    notifyListeners();
+    scan();
+  }
+
+  void _addRecent(String p) {
+    recents.remove(p);
+    recents.insert(0, p);
+    if (recents.length > 30) recents = recents.sublist(0, 30);
+    prefs.setStringList('recents', recents);
+  }
+
+  void addNote(String title, String body) {
+    notes.insert(0, {
+      'title': title,
+      'body': body,
+      'time': DateTime.now().toIso8601String(),
+      'read': false,
+    });
+    if (notes.length > 50) notes = notes.sublist(0, 50);
+    _saveNotes();
+  }
+
+  void _saveNotes() =>
+      prefs.setStringList('notes', notes.map(jsonEncode).toList());
+
+  void markNotesRead() {
+    for (final n in notes) {
+      n['read'] = true;
+    }
+    _saveNotes();
     notifyListeners();
   }
 
-  void toggleFavorite(Song s) {
-    if (!favoriteIds.add(s.id)) {
-      favoriteIds.remove(s.id);
-    }
-
-    SharedPreferences.getInstance().then(
-      (p) => p.setStringList(_favsKey, favoriteIds.toList()),
-    );
-
+  void clearNotes() {
+    notes.clear();
+    _saveNotes();
     notifyListeners();
   }
 
-  Future<void> importAudio() async {
-    try {
-      final picked = await FilePicker.platform.pickFiles(
-        type: FileType.audio,
-        allowMultiple: true,
-      );
-
-      if (picked == null) return;
-
-      final dir = await getApplicationDocumentsDirectory();
-      final musicDir = Directory('${dir.path}/selam_music');
-
-      if (!await musicDir.exists()) {
-        await musicDir.create(recursive: true);
-      }
-
-      for (final item in picked.files) {
-        final src = item.path;
-        if (src == null) continue;
-
-        final safe = item.name.replaceAll(
-          RegExp(r'[^a-zA-Z0-9._ -]'),
-          '_',
-        );
-
-        final dest = File(
-          '${musicDir.path}/${DateTime.now().microsecondsSinceEpoch}_$safe',
-        );
-
-        await File(src).copy(dest.path);
-
-        final title = item.name.replaceFirst(
-          RegExp(r'\.[^.]+$'),
-          '',
-        );
-
-        songs.add(
-          Song(
-            id: DateTime.now().microsecondsSinceEpoch.toString(),
-            title: title.isEmpty ? 'Unknown song' : title,
-            artist: 'Local music',
-            lang: Lang.english,
-            path: dest.path,
-          ),
-        );
-      }
-
-      await _saveSongs();
-      message = null;
-      notifyListeners();
-    } catch (_) {
-      message = 'Could not import the selected audio file.';
-      notifyListeners();
+  Future<bool> _ensurePermission() async {
+    if (await Permission.audio.request().isGranted) {
+      Permission.notification.request();
+      return true;
     }
+    final ok = await Permission.storage.request().isGranted;
+    if (ok) Permission.notification.request();
+    return ok;
   }
 
-  Future<void> play(Song s) async {
-    if (!s.isLocal) {
-      message = 'Import an audio file from your phone to play real music.';
+  Future<void> scan() async {
+    if (scanning) return;
+    scanning = true;
+    permissionDenied = false;
+    notifyListeners();
+
+    if (!await _ensurePermission()) {
+      scanning = false;
+      permissionDenied = true;
       notifyListeners();
       return;
     }
 
-    try {
-      message = null;
-      current = s;
-      notifyListeners();
-
-      await player.setFilePath(s.path!);
-      await player.play();
-
-      recentIds.remove(s.id);
-      recentIds.insert(0, s.id);
-
-      if (recentIds.length > 30) {
-        recentIds.removeRange(30, recentIds.length);
-      }
-
-      final p = await SharedPreferences.getInstance();
-      await p.setStringList(_recentKey, recentIds);
-
-      notifyListeners();
-    } catch (_) {
-      message =
-          'Unable to play this file. Import it again or try another audio format.';
-      notifyListeners();
-    }
-  }
-
-  Future<void> togglePlayback() async {
-    try {
-      if (player.processingState == ProcessingState.completed) {
-        await player.seek(Duration.zero);
-        await player.play();
-      } else if (player.playing) {
-        await player.pause();
-      } else if (current != null) {
-        await player.play();
-      }
-    } catch (_) {
-      message = 'Playback could not start.';
-      notifyListeners();
-    }
-  }
-
-  Future<void> next() async {
-    final list = visible.where((s) => s.isLocal).toList();
-    if (list.isEmpty) return;
-
-    final i = current == null
-        ? -1
-        : list.indexWhere((s) => s.id == current!.id);
-
-    await play(list[(i + 1) % list.length]);
-  }
-
-  Future<void> previous() async {
-    if (position > const Duration(seconds: 3)) {
-      await player.seek(Duration.zero);
-      return;
-    }
-
-    final list = visible.where((s) => s.isLocal).toList();
-    if (list.isEmpty) return;
-
-    final i = current == null
-        ? 0
-        : list.indexWhere((s) => s.id == current!.id);
-
-    await play(list[(i <= 0 ? list.length : i) - 1]);
-  }
-
-  Future<void> seek(Duration d) => player.seek(d);
-
-  Future<void> stop() async {
-    await player.stop();
-    current = null;
-    message = null;
+    final found = <Song>[];
+    await _walk(Directory('/storage/emulated/0'), found, 0);
+    found.sort((a, b) => a.title.toLowerCase().compareTo(b.title.toLowerCase()));
+    songs = found;
+    prefs.setStringList('songs', found.map((s) => s.path).toList());
+    scanning = false;
+    addNote('Library updated', 'Found ${found.length} songs on your phone.');
     notifyListeners();
   }
 
-  Future<void> removeSong(Song s) async {
-    songs.removeWhere((x) => x.id == s.id);
-    favoriteIds.remove(s.id);
-    recentIds.remove(s.id);
-
-    if (current?.id == s.id) {
-      await stop();
-    }
-
-    if (s.isLocal) {
-      try {
-        final f = File(s.path!);
-        if (await f.exists()) {
-          await f.delete();
+  Future<void> _walk(Directory dir, List<Song> out, int depth) async {
+    if (depth > 8) return;
+    try {
+      await for (final e in dir.list(followLinks: false)) {
+        final base = e.path.split('/').last;
+        if (base.startsWith('.')) continue;
+        if (e is Directory) {
+          if (e.path == '/storage/emulated/0/Android') continue;
+          await _walk(e, out, depth + 1);
+        } else if (e is File) {
+          final lower = e.path.toLowerCase();
+          if (audioExts.any(lower.endsWith)) out.add(Song.fromPath(e.path));
         }
-      } catch (_) {}
-    }
+      }
+    } catch (_) {}
+  }
 
-    await _saveSongs();
+  Future<void> playQueue(List<Song> list, int index, {bool? shuffle}) async {
+    if (list.isEmpty) return;
+    queue = list;
+    final source = ConcatenatingAudioSource(
+      children: list
+          .map((s) => AudioSource.file(
+                s.path,
+                tag: MediaItem(id: s.path, title: s.title, album: s.folder, artist: 'Enu'),
+              ))
+          .toList(),
+    );
+    try {
+      await player.setAudioSource(source, initialIndex: index);
+      await player.setShuffleModeEnabled(shuffle ?? shuffleDefault);
+      player.play();
+    } catch (_) {}
+  }
 
-    final p = await SharedPreferences.getInstance();
-    await p.setStringList(_favsKey, favoriteIds.toList());
-    await p.setStringList(_recentKey, recentIds);
+  void shuffleAll() {
+    if (songs.isEmpty) return;
+    playQueue(songs, DateTime.now().millisecond % songs.length, shuffle: true);
+  }
 
+  bool isFav(Song s) => favorites.contains(s.path);
+
+  void toggleFav(Song s) {
+    isFav(s) ? favorites.remove(s.path) : favorites.add(s.path);
+    prefs.setStringList('favs', favorites.toList());
     notifyListeners();
   }
 
-  @override
-  void dispose() {
-    unawaited(_playerSub?.cancel() ?? Future<void>.value());
-    unawaited(_durationSub?.cancel() ?? Future<void>.value());
-    unawaited(player.dispose());
-    super.dispose();
+  List<Song> get favSongs => songs.where(isFav).toList();
+
+  List<Song> get recentSongs {
+    final map = {for (final s in songs) s.path: s};
+    return recents.map((p) => map[p]).whereType<Song>().toList();
+  }
+
+  void setName(String n) {
+    name = n.trim().isEmpty ? 'Friend' : n.trim();
+    prefs.setString('name', name);
+    notifyListeners();
+  }
+
+  void setShuffleDefault(bool v) {
+    shuffleDefault = v;
+    prefs.setBool('shuffle', v);
+    notifyListeners();
+  }
+
+  void clearRecents() {
+    recents.clear();
+    prefs.setStringList('recents', []);
+    notifyListeners();
+  }
+
+  void clearFavorites() {
+    favorites.clear();
+    prefs.setStringList('favs', []);
+    notifyListeners();
   }
 }
 
-extension FirstOrNull<T> on Iterable<T> {
-  T? get firstOrNull {
-    final i = iterator;
-    return i.moveNext() ? i.current : null;
+final app = AppState();
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await JustAudioBackground.init(
+    androidNotificationChannelId: 'com.enu.app.audio',
+    androidNotificationChannelName: 'Enu playback',
+    androidNotificationOngoing: true,
+  );
+  await app.init();
+  runApp(const EnuApp());
+}
+
+class EnuApp extends StatelessWidget {
+  const EnuApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Enu',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: kBg,
+        colorScheme: const ColorScheme.dark(primary: purple, surface: kSurface),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: kBg,
+          elevation: 0,
+          scrolledUnderElevation: 0,
+        ),
+        navigationBarTheme: NavigationBarThemeData(
+          backgroundColor: kSurface,
+          indicatorColor: purple.withValues(alpha: .25),
+        ),
+      ),
+      home: const EnuShell(),
+    );
   }
 }
 
-final SelamState app = SelamState();
-
-class SelamApp extends StatefulWidget {
-  const SelamApp({super.key});
-
-  @override
-  State<SelamApp> createState() => _SelamAppState();
+String fmt(Duration d) {
+  final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+  final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+  return d.inHours > 0 ? '${d.inHours}:$m:$s' : '${d.inMinutes}:$s';
 }
 
-class _SelamAppState extends State<SelamApp> {
-  @override
-  void initState() {
-    super.initState();
-    app.init();
-  }
+void toast(BuildContext c, String msg) {
+  ScaffoldMessenger.of(c)
+    ..hideCurrentSnackBar()
+    ..showSnackBar(SnackBar(content: Text(msg)));
+}
+
+// ───────────────────────── Shell ─────────────────────────
+
+class EnuShell extends StatefulWidget {
+  const EnuShell({super.key});
 
   @override
-  void dispose() {
-    app.dispose();
-    super.dispose();
-  }
+  State<EnuShell> createState() => _EnuShellState();
+}
+
+class _EnuShellState extends State<EnuShell> {
+  int tab = 0;
 
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
       listenable: app,
       builder: (context, _) {
-        return MaterialApp(
-          debugShowCheckedModeBanner: false,
-          title: 'Selam Worship',
-          themeMode: app.themeMode,
-          theme: ThemeData(
-            useMaterial3: true,
-            colorScheme: ColorScheme.fromSeed(
-              seedColor: const Color(0xFF7655C7),
-              brightness: Brightness.light,
-            ),
+        final pages = [
+          HomePage(goLibrary: () => setState(() => tab = 1)),
+          const LibraryPage(),
+          const ProfilePage(),
+        ];
+        return Scaffold(
+          appBar: AppBar(
+            title: const Text('Enu', style: TextStyle(fontWeight: FontWeight.bold)),
+            actions: [
+              IconButton(
+                onPressed: () => Navigator.push(context,
+                    MaterialPageRoute(builder: (_) => const NotificationsPage())),
+                icon: Badge(
+                  isLabelVisible: app.unread > 0,
+                  label: Text('${app.unread}'),
+                  child: const Icon(Icons.notifications_rounded),
+                ),
+              ),
+              IconButton(
+                onPressed: () => Navigator.push(context,
+                    MaterialPageRoute(builder: (_) => const SettingsPage())),
+                icon: const Icon(Icons.settings_rounded),
+              ),
+            ],
           ),
-          darkTheme: ThemeData(
-            useMaterial3: true,
-            colorScheme: ColorScheme.fromSeed(
-              seedColor: const Color(0xFF9B7BFA),
-              brightness: Brightness.dark,
-            ),
+          body: pages[tab],
+          bottomNavigationBar: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (app.current != null) const MiniPlayer(),
+              NavigationBar(
+                selectedIndex: tab,
+                onDestinationSelected: (i) => setState(() => tab = i),
+                destinations: const [
+                  NavigationDestination(icon: Icon(Icons.home_rounded), label: 'Home'),
+                  NavigationDestination(
+                      icon: Icon(Icons.library_music_rounded), label: 'Library'),
+                  NavigationDestination(icon: Icon(Icons.person_rounded), label: 'Profile'),
+                ],
+              ),
+            ],
           ),
-          home: app.loading
-              ? const Scaffold(
-                  body: Center(child: CircularProgressIndicator()),
-                )
-              : app.user == null
-                  ? const AuthPage()
-                  : const HomePage(),
         );
       },
     );
   }
 }
 
-class AuthPage extends StatefulWidget {
-  const AuthPage({super.key});
+// ───────────────────────── Home ─────────────────────────
 
-  @override
-  State<AuthPage> createState() => _AuthPageState();
-}
-
-class _AuthPageState extends State<AuthPage> {
-  final name = TextEditingController();
-  final email = TextEditingController();
-  final password = TextEditingController();
-
-  bool createAccount = false;
-  String? error;
-
-  @override
-  void dispose() {
-    name.dispose();
-    email.dispose();
-    password.dispose();
-    super.dispose();
-  }
-
-  void submit() {
-    FocusScope.of(context).unfocus();
-
-    final result = createAccount
-        ? app.signUp(name.text, email.text, password.text)
-        : app.logIn(email.text, password.text);
-
-    setState(() => error = result);
-  }
+class HomePage extends StatelessWidget {
+  final VoidCallback goLibrary;
+  const HomePage({super.key, required this.goLibrary});
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 420),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Container(
-                    width: 100,
-                    height: 100,
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).colorScheme.primaryContainer,
-                      borderRadius: BorderRadius.circular(30),
-                    ),
-                    child: Icon(
-                      Icons.church,
-                      size: 54,
-                      color: Theme.of(context).colorScheme.primary,
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                  Text(
-                    'Selam Worship',
-                    style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                          fontWeight: FontWeight.bold,
-                        ),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text('A place for worship and praise'),
-                  const SizedBox(height: 32),
-                  if (createAccount)
-                    TextField(
-                      controller: name,
-                      textCapitalization: TextCapitalization.words,
-                      decoration: const InputDecoration(
-                        labelText: 'Your name',
-                        prefixIcon: Icon(Icons.person_outline),
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                  if (createAccount) const SizedBox(height: 12),
-                  TextField(
-                    controller: email,
-                    keyboardType: TextInputType.emailAddress,
-                    decoration: const InputDecoration(
-                      labelText: 'Email',
-                      prefixIcon: Icon(Icons.email_outlined),
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: password,
-                    obscureText: true,
-                    decoration: const InputDecoration(
-                      labelText: 'Password',
-                      prefixIcon: Icon(Icons.lock_outline),
-                      border: OutlineInputBorder(),
-                    ),
-                    onSubmitted: (_) => submit(),
-                  ),
-                  if (error != null) ...[
-                    const SizedBox(height: 12),
-                    ErrorMessage(error!),
-                  ],
-                  const SizedBox(height: 20),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton(
-                      onPressed: submit,
-                      child: Text(
-                        createAccount ? 'Create account' : 'Log in',
-                      ),
-                    ),
-                  ),
-                  TextButton(
-                    onPressed: () {
-                      setState(() {
-                        createAccount = !createAccount;
-                        error = null;
-                      });
-                    },
-                    child: Text(
-                      createAccount
-                          ? 'Already have an account? Log in'
-                          : 'New here? Create an account',
-                    ),
-                  ),
-                ],
-              ),
-            ),
+    final recent = app.recentSongs;
+    final cards = [
+      _Card('Favorites', '${app.favSongs.length} songs', Icons.favorite_rounded, () {
+        final f = app.favSongs;
+        f.isEmpty ? toast(context, 'No favorites yet. Tap the heart on a song.') : app.playQueue(f, 0);
+      }),
+      _Card('Recently played', '${recent.length} songs', Icons.history_rounded, () {
+        recent.isEmpty ? toast(context, 'Nothing played yet.') : app.playQueue(recent, 0);
+      }),
+      _Card('All songs', '${app.songs.length} on your phone', Icons.library_music_rounded,
+          goLibrary),
+      _Card('Shuffle all', 'Surprise me', Icons.shuffle_rounded, () {
+        app.songs.isEmpty ? toast(context, 'No songs found yet.') : app.shuffleAll();
+      }),
+    ];
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(18, 8, 18, 24),
+      children: [
+        Text('Hello, ${app.name}',
+            style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 4),
+        const Text('Your music, available offline.', style: TextStyle(color: muted)),
+        const SizedBox(height: 18),
+        GridView.count(
+          crossAxisCount: 2,
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          mainAxisSpacing: 14,
+          crossAxisSpacing: 14,
+          childAspectRatio: 1.25,
+          children: cards.map((c) => _tile(c)).toList(),
+        ),
+        if (recent.isNotEmpty) ...[
+          const SizedBox(height: 24),
+          const Text('Jump back in',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 6),
+          for (var i = 0; i < recent.length && i < 5; i++)
+            SongTile(song: recent[i], queue: recent, index: i),
+        ],
+      ],
+    );
+  }
+
+  Widget _tile(_Card c) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(22),
+      onTap: c.onTap,
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF21172F), Color(0xFF130F1B)],
           ),
+          borderRadius: BorderRadius.circular(22),
+          border: Border.all(color: cardBorder),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Container(
+              width: 43,
+              height: 43,
+              decoration: BoxDecoration(
+                color: purple.withValues(alpha: .17),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Icon(c.icon, color: purple, size: 23),
+            ),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(c.title,
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                const SizedBox(height: 4),
+                Text(c.subtitle, style: const TextStyle(color: muted, fontSize: 12)),
+              ],
+            ),
+          ],
         ),
       ),
     );
   }
 }
 
-class HomePage extends StatefulWidget {
-  const HomePage({super.key});
-
-  @override
-  State<HomePage> createState() => _HomePageState();
+class _Card {
+  final String title, subtitle;
+  final IconData icon;
+  final VoidCallback onTap;
+  _Card(this.title, this.subtitle, this.icon, this.onTap);
 }
 
-class _HomePageState extends State<HomePage> {
-  int tab = 0;
+// ───────────────────────── Library ─────────────────────────
 
-  final pages = const [
-    DiscoverPage(),
-    SearchPage(),
-    LibraryPage(),
-    SettingsPage(),
-  ];
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Selam Worship'),
-        actions: [
-          IconButton(
-            tooltip: 'Import music',
-            icon: const Icon(Icons.library_music_outlined),
-            onPressed: app.importAudio,
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Expanded(child: pages[tab]),
-          const MiniPlayer(),
-        ],
-      ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: tab,
-        onDestinationSelected: (v) => setState(() => tab = v),
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.home_outlined),
-            selectedIcon: Icon(Icons.home),
-            label: 'Home',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.search),
-            label: 'Search',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.library_music_outlined),
-            selectedIcon: Icon(Icons.library_music),
-            label: 'Library',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.settings_outlined),
-            selectedIcon: Icon(Icons.settings),
-            label: 'Settings',
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class DiscoverPage extends StatelessWidget {
-  const DiscoverPage({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: app,
-      builder: (_, __) {
-        return ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            Container(
-              padding: const EdgeInsets.all(22),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(24),
-                gradient: const LinearGradient(
-                  colors: [
-                    Color(0xFF7655C7),
-                    Color(0xFF39245F),
-                  ],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-              ),
-              child: const Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Icon(Icons.church, size: 42, color: Colors.white),
-                  SizedBox(height: 14),
-                  Text(
-                    'Let worship fill your heart',
-                    style: TextStyle(
-                      fontSize: 24,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                    ),
-                  ),
-                  SizedBox(height: 8),
-                  Text(
-                    'Listen to the songs you love.',
-                    style: TextStyle(color: Colors.white70),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 22),
-            Text(
-              'Your music',
-              style: Theme.of(context).textTheme.titleLarge,
-            ),
-            const SizedBox(height: 8),
-            FilledButton.icon(
-              onPressed: app.importAudio,
-              icon: const Icon(Icons.add),
-              label: const Text('Import music from phone'),
-            ),
-            const SizedBox(height: 12),
-            Wrap(
-              spacing: 8,
-              children: [
-                ChoiceChip(
-                  label: const Text('All'),
-                  selected: app.filter == null,
-                  onSelected: (_) => app.setFilter(null),
-                ),
-                ChoiceChip(
-                  label: const Text('አማርኛ'),
-                  selected: app.filter == Lang.amharic,
-                  onSelected: (_) => app.setFilter(Lang.amharic),
-                ),
-                ChoiceChip(
-                  label: const Text('English'),
-                  selected: app.filter == Lang.english,
-                  onSelected: (_) => app.setFilter(Lang.english),
-                ),
-              ],
-            ),
-            if (app.message != null) ErrorMessage(app.message!),
-            if (app.visible.isEmpty)
-              const EmptyMessage(
-                'Your library is empty',
-                'Import audio files from your phone to start listening.',
-              ),
-            for (final s in app.visible) SongTile(song: s),
-          ],
-        );
-      },
-    );
-  }
-}
-
-class SearchPage extends StatefulWidget {
-  const SearchPage({super.key});
-
-  @override
-  State<SearchPage> createState() => _SearchPageState();
-}
-
-class _SearchPageState extends State<SearchPage> {
-  String q = '';
-
-  @override
-  Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: app,
-      builder: (_, __) {
-        final found = app.visible.where((s) {
-          return s.title.toLowerCase().contains(q.toLowerCase()) ||
-              s.artist.toLowerCase().contains(q.toLowerCase());
-        }).toList();
-
-        return ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            TextField(
-              onChanged: (v) => setState(() => q = v),
-              decoration: const InputDecoration(
-                hintText: 'Search song or artist / ዘፈን ፈልግ',
-                prefixIcon: Icon(Icons.search),
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            if (found.isEmpty)
-              const EmptyMessage(
-                'No songs found',
-                'Import music or try another search.',
-              ),
-            for (final s in found) SongTile(song: s),
-          ],
-        );
-      },
-    );
-  }
-}
-
-class LibraryPage extends StatelessWidget {
+class LibraryPage extends StatefulWidget {
   const LibraryPage({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: app,
-      builder: (_, __) {
-        return ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            Text(
-              'Your Library',
-              style: Theme.of(context).textTheme.headlineSmall,
-            ),
-            const SizedBox(height: 12),
-            Text(
-              'Favorites',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            if (app.favorites.isEmpty)
-              const EmptyMessage(
-                'No favorites yet',
-                'Tap the heart beside a song to save it.',
-              ),
-            for (final s in app.favorites) SongTile(song: s),
-            const Divider(height: 28),
-            Text(
-              'Recently played',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            for (final s in app.recents) SongTile(song: s),
-            const Divider(height: 28),
-            Text(
-              'Imported songs',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            for (final s in app.songs)
-              SongTile(song: s, removable: true),
-          ],
-        );
-      },
-    );
-  }
+  State<LibraryPage> createState() => _LibraryPageState();
 }
 
-class SettingsPage extends StatelessWidget {
-  const SettingsPage({super.key});
-
-  Future<void> editName(BuildContext context) async {
-    final c = TextEditingController(text: app.user!.name);
-
-    final result = await showDialog<String>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Edit name'),
-        content: TextField(controller: c),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, c.text.trim()),
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-
-    c.dispose();
-
-    if (result != null && result.isNotEmpty) {
-      app.setName(result);
-    }
-  }
-
-  Future<void> deleteAccount(BuildContext context) async {
-    final yes = await showDialog<bool>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Delete account?'),
-        content: const Text(
-          'This deletes the local demo account. Imported songs remain.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-
-    if (yes == true) {
-      await app.deleteAccount();
-    }
-  }
+class _LibraryPageState extends State<LibraryPage> {
+  String query = '';
 
   @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: app,
-      builder: (_, __) {
-        return ListView(
+    if (app.permissionDenied) {
+      return _message(
+        Icons.lock_rounded,
+        'Enu needs access to your audio files to show your music.',
+        [
+          FilledButton(onPressed: app.scan, child: const Text('Allow access')),
+          TextButton(onPressed: openAppSettings, child: const Text('Open app settings')),
+        ],
+      );
+    }
+    if (app.scanning && app.songs.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (app.songs.isEmpty) {
+      return _message(Icons.music_off_rounded, 'No songs found on your phone.',
+          [FilledButton(onPressed: app.scan, child: const Text('Scan again'))]);
+    }
+
+    final list = app.songs
+        .where((s) => s.title.toLowerCase().contains(query.toLowerCase()))
+        .toList();
+
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(18, 4, 18, 8),
+          child: TextField(
+            onChanged: (v) => setState(() => query = v),
+            decoration: InputDecoration(
+              hintText: 'Search ${app.songs.length} songs',
+              prefixIcon: const Icon(Icons.search_rounded),
+              filled: true,
+              fillColor: kSurface,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide.none,
+              ),
+            ),
+          ),
+        ),
+        if (app.scanning) const LinearProgressIndicator(minHeight: 2),
+        Expanded(
+          child: RefreshIndicator(
+            onRefresh: app.scan,
+            child: ListView.builder(
+              itemCount: list.length,
+              itemBuilder: (c, i) => SongTile(song: list[i], queue: list, index: i),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _message(IconData icon, String text, List<Widget> actions) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: Text(
-                'Settings',
-                style: TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
-            ListTile(
-              leading: const CircleAvatar(
-                child: Icon(Icons.person),
-              ),
-              title: Text(app.user!.name),
-              subtitle: Text(app.user!.email),
-              trailing: IconButton(
-                icon: const Icon(Icons.edit),
-                onPressed: () => editName(context),
-              ),
-            ),
-            const Divider(),
-            SwitchListTile(
-              secondary: const Icon(Icons.dark_mode),
-              title: const Text('Dark mode'),
-              value: app.themeMode == ThemeMode.dark,
-              onChanged: app.setTheme,
-            ),
-            ListTile(
-              leading: const Icon(Icons.language),
-              title: const Text('Music language'),
-              trailing: DropdownButton<Lang?>(
-                value: app.filter,
-                underline: const SizedBox(),
-                items: const [
-                  DropdownMenuItem<Lang?>(
-                    value: null,
-                    child: Text('Both'),
-                  ),
-                  DropdownMenuItem<Lang?>(
-                    value: Lang.amharic,
-                    child: Text('አማርኛ'),
-                  ),
-                  DropdownMenuItem<Lang?>(
-                    value: Lang.english,
-                    child: Text('English'),
-                  ),
-                ],
-                onChanged: app.setFilter,
-              ),
-            ),
-            const ListTile(
-              leading: Icon(Icons.info_outline),
-              title: Text('About Selam Worship'),
-              subtitle: Text('Version 1.1 • Local music player'),
-            ),
-            const ListTile(
-              leading: Icon(Icons.privacy_tip_outlined),
-              title: Text('Privacy'),
-              subtitle: Text(
-                'This demo stores account details on this device.',
-              ),
-            ),
-            ListTile(
-              leading: const Icon(Icons.logout),
-              title: const Text('Log out'),
-              onTap: app.logOut,
-            ),
-            ListTile(
-              leading: Icon(
-                Icons.delete_forever,
-                color: Theme.of(context).colorScheme.error,
-              ),
-              title: const Text('Delete account'),
-              onTap: () => deleteAccount(context),
-            ),
+            Icon(icon, size: 54, color: purple),
+            const SizedBox(height: 14),
+            Text(text, textAlign: TextAlign.center, style: const TextStyle(color: muted)),
+            const SizedBox(height: 14),
+            ...actions,
           ],
-        );
-      },
+        ),
+      ),
     );
   }
 }
 
 class SongTile extends StatelessWidget {
   final Song song;
-  final bool removable;
-
-  const SongTile({
-    super.key,
-    required this.song,
-    this.removable = false,
-  });
+  final List<Song> queue;
+  final int index;
+  const SongTile({super.key, required this.song, required this.queue, required this.index});
 
   @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: app,
-      builder: (_, __) {
-        final active = app.current?.id == song.id;
-        final fav = app.favoriteIds.contains(song.id);
-
-        return ListTile(
-          leading: CircleAvatar(
-            child: Icon(
-              active && app.playing
-                  ? Icons.graphic_eq
-                  : Icons.music_note,
-            ),
-          ),
-          title: Text(
-            song.title,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          subtitle: Text(
-            '${song.artist} • ${song.lang == Lang.amharic ? 'አማርኛ' : 'English'}',
-          ),
-          trailing: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              IconButton(
-                icon: Icon(
-                  fav ? Icons.favorite : Icons.favorite_border,
-                  color: fav ? Colors.redAccent : null,
-                ),
-                onPressed: () => app.toggleFavorite(song),
-              ),
-              if (removable)
-                IconButton(
-                  icon: const Icon(Icons.delete_outline),
-                  onPressed: () => app.removeSong(song),
-                ),
-            ],
-          ),
-          onTap: () => app.play(song),
-        );
-      },
+    final playing = app.current?.path == song.path;
+    return ListTile(
+      leading: Container(
+        width: 44,
+        height: 44,
+        decoration: BoxDecoration(
+          color: purple.withValues(alpha: playing ? .35 : .15),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Icon(playing ? Icons.equalizer_rounded : Icons.music_note_rounded,
+            color: purple),
+      ),
+      title: Text(song.title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+              fontWeight: FontWeight.w600, color: playing ? purple : Colors.white)),
+      subtitle: Text(song.folder,
+          maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: muted)),
+      trailing: IconButton(
+        icon: Icon(app.isFav(song) ? Icons.favorite_rounded : Icons.favorite_border_rounded,
+            color: app.isFav(song) ? purple : muted),
+        onPressed: () => app.toggleFav(song),
+      ),
+      onTap: () => app.playQueue(queue, index),
     );
   }
 }
+
+// ───────────────────────── Mini player ─────────────────────────
 
 class MiniPlayer extends StatelessWidget {
   const MiniPlayer({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: app,
-      builder: (_, __) {
-        final s = app.current;
-        if (s == null) return const SizedBox.shrink();
-
-        final d = app.duration.inMilliseconds;
-        final v = d <= 0
-            ? 0.0
-            : (app.position.inMilliseconds / d).clamp(0.0, 1.0);
-
-        return Material(
-          color: Theme.of(context).colorScheme.surfaceContainerHighest,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              LinearProgressIndicator(value: v, minHeight: 2),
-              ListTile(
-                dense: true,
-                leading: const Icon(Icons.music_note),
-                title: Text(
-                  s.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                subtitle: Text(s.artist),
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => const PlayerPage(),
-                    ),
-                  );
-                },
-                trailing: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    IconButton(
-                      icon: Icon(
-                        app.playing ? Icons.pause : Icons.play_arrow,
-                      ),
-                      onPressed: app.togglePlayback,
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.skip_next),
-                      onPressed: app.next,
-                    ),
-                  ],
-                ),
+    final s = app.current!;
+    return InkWell(
+      onTap: () => Navigator.push(
+          context, MaterialPageRoute(builder: (_) => const NowPlayingPage())),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(18, 8, 8, 8),
+        decoration: const BoxDecoration(
+          color: Color(0xFF211830),
+          border: Border(top: BorderSide(color: cardBorder)),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                gradient: const LinearGradient(
+                    colors: [Color(0xFF8050D5), Color(0xFF302044)]),
               ),
-            ],
-          ),
-        );
-      },
+              child: const Icon(Icons.music_note_rounded),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(s.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+                  Text(s.folder,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: muted, fontSize: 11)),
+                ],
+              ),
+            ),
+            StreamBuilder<bool>(
+              stream: app.player.playingStream,
+              builder: (c, snap) {
+                final playing = snap.data ?? false;
+                return IconButton(
+                  onPressed: () => playing ? app.player.pause() : app.player.play(),
+                  icon: Icon(playing ? Icons.pause_circle_filled : Icons.play_circle_fill,
+                      color: purple, size: 34),
+                );
+              },
+            ),
+            IconButton(
+              onPressed: () => app.player.seekToNext(),
+              icon: const Icon(Icons.skip_next_rounded),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
 
-class PlayerPage extends StatelessWidget {
-  const PlayerPage({super.key});
+// ───────────────────────── Now playing ─────────────────────────
+
+class NowPlayingPage extends StatelessWidget {
+  const NowPlayingPage({super.key});
 
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
       listenable: app,
-      builder: (_, __) {
+      builder: (context, _) {
         final s = app.current;
-
-        if (s == null) {
-          return const Scaffold(
-            body: Center(child: Text('No song selected')),
-          );
-        }
-
-        final d = app.duration;
-        final max = d.inMilliseconds > 0
-            ? d.inMilliseconds.toDouble()
-            : 1.0;
-        final value = app.position.inMilliseconds
-            .toDouble()
-            .clamp(0.0, max);
-
+        if (s == null) return const Scaffold(body: SizedBox());
         return Scaffold(
-          appBar: AppBar(title: const Text('Now Playing')),
-          body: SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                children: [
-                  Expanded(
-                    child: Center(
-                      child: AspectRatio(
-                        aspectRatio: 1,
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: Theme.of(context)
-                                .colorScheme
-                                .primaryContainer,
-                            borderRadius: BorderRadius.circular(24),
-                          ),
-                          child: Icon(
-                            Icons.church,
-                            size: 100,
-                            color: Theme.of(context).colorScheme.primary,
-                          ),
-                        ),
-                      ),
+          appBar: AppBar(
+            leading: IconButton(
+              icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 30),
+              onPressed: () => Navigator.pop(context),
+            ),
+            title: const Text('Now playing'),
+          ),
+          body: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              children: [
+                const Spacer(),
+                Container(
+                  width: 240,
+                  height: 240,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(32),
+                    gradient: const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [Color(0xFF8050D5), Color(0xFF302044)],
                     ),
                   ),
-                  Text(
-                    s.title,
-                    style: Theme.of(context).textTheme.titleLarge,
-                    textAlign: TextAlign.center,
-                  ),
-                  Text(s.artist),
-                  Slider(
-                    value: value,
-                    max: max,
-                    onChanged: d == Duration.zero
-                        ? null
-                        : (v) => app.seek(
-                              Duration(milliseconds: v.toInt()),
-                            ),
-                  ),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(fmt(app.position.inSeconds)),
-                      Text(fmt(d.inSeconds)),
-                    ],
-                  ),
-                  if (app.message != null)
-                    ErrorMessage(app.message!),
-                  const SizedBox(height: 8),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      IconButton(
-                        iconSize: 40,
-                        icon: const Icon(Icons.skip_previous),
-                        onPressed: app.previous,
+                  child: const Icon(Icons.music_note_rounded, size: 96),
+                ),
+                const Spacer(),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(s.title,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  fontSize: 20, fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 4),
+                          Text(s.folder, style: const TextStyle(color: muted)),
+                        ],
                       ),
-                      const SizedBox(width: 16),
-                      IconButton.filled(
-                        iconSize: 48,
-                        icon: Icon(
-                          app.playing ? Icons.pause : Icons.play_arrow,
+                    ),
+                    IconButton(
+                      onPressed: () => app.toggleFav(s),
+                      icon: Icon(
+                          app.isFav(s)
+                              ? Icons.favorite_rounded
+                              : Icons.favorite_border_rounded,
+                          color: purple),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                StreamBuilder<Duration>(
+                  stream: app.player.positionStream,
+                  builder: (c, snap) {
+                    final pos = snap.data ?? Duration.zero;
+                    final dur = app.player.duration ?? Duration.zero;
+                    final max = dur.inMilliseconds > 0 ? dur.inMilliseconds.toDouble() : 1.0;
+                    final v = pos.inMilliseconds.toDouble().clamp(0.0, max);
+                    return Column(
+                      children: [
+                        Slider(
+                          value: v,
+                          max: max,
+                          onChanged: dur.inMilliseconds > 0
+                              ? (x) => app.player.seek(Duration(milliseconds: x.toInt()))
+                              : null,
                         ),
-                        onPressed: app.togglePlayback,
-                      ),
-                      const SizedBox(width: 16),
-                      IconButton(
-                        iconSize: 40,
-                        icon: const Icon(Icons.skip_next),
-                        onPressed: app.next,
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 20),
-                ],
-              ),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(fmt(pos), style: const TextStyle(color: muted)),
+                              Text(fmt(dur), style: const TextStyle(color: muted)),
+                            ],
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    StreamBuilder<bool>(
+                      stream: app.player.shuffleModeEnabledStream,
+                      builder: (c, snap) {
+                        final on = snap.data ?? false;
+                        return IconButton(
+                          onPressed: () => app.player.setShuffleModeEnabled(!on),
+                          icon: Icon(Icons.shuffle_rounded, color: on ? purple : muted),
+                        );
+                      },
+                    ),
+                    IconButton(
+                      iconSize: 38,
+                      onPressed: () => app.player.seekToPrevious(),
+                      icon: const Icon(Icons.skip_previous_rounded),
+                    ),
+                    StreamBuilder<bool>(
+                      stream: app.player.playingStream,
+                      builder: (c, snap) {
+                        final playing = snap.data ?? false;
+                        return IconButton(
+                          iconSize: 66,
+                          color: purple,
+                          onPressed: () => playing ? app.player.pause() : app.player.play(),
+                          icon: Icon(playing
+                              ? Icons.pause_circle_filled
+                              : Icons.play_circle_fill),
+                        );
+                      },
+                    ),
+                    IconButton(
+                      iconSize: 38,
+                      onPressed: () => app.player.seekToNext(),
+                      icon: const Icon(Icons.skip_next_rounded),
+                    ),
+                    StreamBuilder<LoopMode>(
+                      stream: app.player.loopModeStream,
+                      builder: (c, snap) {
+                        final m = snap.data ?? LoopMode.off;
+                        return IconButton(
+                          onPressed: () => app.player.setLoopMode(
+                              LoopMode.values[(m.index + 1) % LoopMode.values.length]),
+                          icon: Icon(
+                              m == LoopMode.one
+                                  ? Icons.repeat_one_rounded
+                                  : Icons.repeat_rounded,
+                              color: m == LoopMode.off ? muted : purple),
+                        );
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+              ],
             ),
           ),
         );
@@ -1303,58 +801,198 @@ class PlayerPage extends StatelessWidget {
   }
 }
 
-class EmptyMessage extends StatelessWidget {
-  final String title, subtitle;
+// ───────────────────────── Profile ─────────────────────────
 
-  const EmptyMessage(
-    this.title,
-    this.subtitle, {
-    super.key,
-  });
+class ProfilePage extends StatelessWidget {
+  const ProfilePage({super.key});
 
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        children: [
-          const Icon(Icons.music_note, size: 42),
-          const SizedBox(height: 8),
-          Text(
-            title,
-            style: Theme.of(context).textTheme.titleMedium,
-            textAlign: TextAlign.center,
-          ),
-          Text(subtitle, textAlign: TextAlign.center),
+  Future<void> _edit(BuildContext context) async {
+    final ctrl = TextEditingController(text: app.name);
+    final res = await showDialog<String>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('Your name'),
+        content: TextField(controller: ctrl, autofocus: true),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(c, ctrl.text), child: const Text('Save')),
         ],
       ),
     );
+    if (res != null) app.setName(res);
   }
-}
-
-class ErrorMessage extends StatelessWidget {
-  final String text;
-
-  const ErrorMessage(this.text, {super.key});
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      margin: const EdgeInsets.symmetric(vertical: 8),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.errorContainer,
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Text(
-        text,
-        style: TextStyle(
-          color: Theme.of(context).colorScheme.onErrorContainer,
+    return ListView(
+      padding: const EdgeInsets.all(24),
+      children: [
+        Center(
+          child: CircleAvatar(
+            radius: 46,
+            backgroundColor: purple.withValues(alpha: .3),
+            child: Text(app.name.characters.first.toUpperCase(),
+                style: const TextStyle(fontSize: 38, fontWeight: FontWeight.bold)),
+          ),
+        ),
+        const SizedBox(height: 14),
+        Center(
+          child: Text(app.name,
+              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+        ),
+        Center(
+          child: TextButton.icon(
+            onPressed: () => _edit(context),
+            icon: const Icon(Icons.edit_rounded, size: 16),
+            label: const Text('Edit name'),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Row(
+          children: [
+            _stat('Songs', '${app.songs.length}'),
+            _stat('Favorites', '${app.favorites.length}'),
+            _stat('Plays', '${app.played}'),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _stat(String label, String value) {
+    return Expanded(
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 5),
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        decoration: BoxDecoration(
+          color: kSurface,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: cardBorder),
+        ),
+        child: Column(
+          children: [
+            Text(value, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 2),
+            Text(label, style: const TextStyle(color: muted, fontSize: 12)),
+          ],
         ),
       ),
     );
   }
 }
 
-String fmt(int s) =>
-    '${s ~/ 60}:${(s % 60).toString().padLeft(2, '0')}';
+// ───────────────────────── Notifications ─────────────────────────
+
+class NotificationsPage extends StatefulWidget {
+  const NotificationsPage({super.key});
+
+  @override
+  State<NotificationsPage> createState() => _NotificationsPageState();
+}
+
+class _NotificationsPageState extends State<NotificationsPage> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => app.markNotesRead());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: app,
+      builder: (context, _) => Scaffold(
+        appBar: AppBar(
+          title: const Text('Notifications'),
+          actions: [
+            if (app.notes.isNotEmpty)
+              IconButton(
+                  onPressed: app.clearNotes, icon: const Icon(Icons.delete_sweep_rounded)),
+          ],
+        ),
+        body: app.notes.isEmpty
+            ? const Center(child: Text('Nothing here yet.', style: TextStyle(color: muted)))
+            : ListView.builder(
+                itemCount: app.notes.length,
+                itemBuilder: (c, i) {
+                  final n = app.notes[i];
+                  final t = DateTime.tryParse(n['time'] ?? '');
+                  return ListTile(
+                    leading: const Icon(Icons.notifications_rounded, color: purple),
+                    title: Text(n['title'] ?? ''),
+                    subtitle: Text(n['body'] ?? ''),
+                    trailing: t == null
+                        ? null
+                        : Text(
+                            '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}',
+                            style: const TextStyle(color: muted, fontSize: 12)),
+                  );
+                },
+              ),
+      ),
+    );
+  }
+}
+
+// ───────────────────────── Settings ─────────────────────────
+
+class SettingsPage extends StatelessWidget {
+  const SettingsPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: app,
+      builder: (context, _) => Scaffold(
+        appBar: AppBar(title: const Text('Settings')),
+        body: ListView(
+          children: [
+            SwitchListTile(
+              activeThumbColor: purple,
+              secondary: const Icon(Icons.shuffle_rounded),
+              title: const Text('Shuffle by default'),
+              subtitle: const Text('Start new queues in shuffle mode'),
+              value: app.shuffleDefault,
+              onChanged: app.setShuffleDefault,
+            ),
+            ListTile(
+              leading: const Icon(Icons.refresh_rounded),
+              title: const Text('Rescan music'),
+              subtitle: Text('${app.songs.length} songs found'),
+              onTap: () {
+                app.scan();
+                toast(context, 'Scanning your phone…');
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.history_rounded),
+              title: const Text('Clear recently played'),
+              onTap: () {
+                app.clearRecents();
+                toast(context, 'Recently played cleared');
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.heart_broken_rounded),
+              title: const Text('Clear favorites'),
+              onTap: () {
+                app.clearFavorites();
+                toast(context, 'Favorites cleared');
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.lock_open_rounded),
+              title: const Text('App permissions'),
+              onTap: openAppSettings,
+            ),
+            const ListTile(
+              leading: Icon(Icons.info_outline_rounded),
+              title: Text('Enu'),
+              subtitle: Text('Version 1.0.0 • Works fully offline'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
